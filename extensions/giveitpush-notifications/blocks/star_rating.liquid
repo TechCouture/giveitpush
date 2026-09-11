@@ -1,0 +1,354 @@
+<div
+  id="giveitpush-notification"
+  class="giveitpush-notification"
+  data-shop="{{ shop.permanent_domain }}"
+  {{ block.shopify_attributes }}
+>
+  <div class="giveitpush-notification__content">
+    <div class="giveitpush-notification__icon" aria-hidden="true">🔔</div>
+
+    <div class="giveitpush-notification__text">
+      <div class="giveitpush-notification__title">
+        Get instant updates
+      </div>
+
+      <div class="giveitpush-notification__message">
+        Allow notifications for important updates from this store.
+      </div>
+    </div>
+
+    <button
+      type="button"
+      class="giveitpush-notification__button"
+      id="giveitpush-notification-button"
+    >
+      Allow Notifications
+    </button>
+  </div>
+
+  <div
+    class="giveitpush-notification__status"
+    id="giveitpush-notification-status"
+    role="status"
+    aria-live="polite"
+  ></div>
+</div>
+
+<style>
+  .giveitpush-notification {
+    width: 100%;
+    box-sizing: border-box;
+    margin: 16px 0;
+  }
+
+  .giveitpush-notification__content {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    border-radius: 12px;
+    background: #fff;
+  }
+
+  .giveitpush-notification__icon {
+    width: 42px;
+    height: 42px;
+    flex: 0 0 42px;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #f5f5f5;
+    font-size: 20px;
+  }
+
+  .giveitpush-notification__text {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .giveitpush-notification__title {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .giveitpush-notification__message {
+    margin-top: 4px;
+    font-size: 13px;
+    line-height: 1.45;
+    opacity: 0.72;
+  }
+
+  .giveitpush-notification__button {
+    appearance: none;
+    border: 0;
+    border-radius: 8px;
+    padding: 11px 16px;
+    background: #111;
+    color: #fff;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .giveitpush-notification__button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .giveitpush-notification__status {
+    margin-top: 8px;
+    font-size: 13px;
+  }
+
+  @media (max-width: 640px) {
+    .giveitpush-notification__content {
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+
+    .giveitpush-notification__text {
+      flex: 1 1 calc(100% - 60px);
+    }
+
+    .giveitpush-notification__button {
+      width: 100%;
+      margin-left: 56px;
+    }
+  }
+</style>
+
+<script>
+  (() => {
+    const root = document.getElementById('giveitpush-notification');
+    const button = document.getElementById('giveitpush-notification-button');
+    const status = document.getElementById('giveitpush-notification-status');
+
+    if (!root || !button || !status) return;
+
+    const APP_PROXY_BASE = '/apps/giveitpush';
+
+    const setStatus = (message) => {
+      status.textContent = message;
+    };
+
+    const checkSupport = () => {
+      if (!('Notification' in window)) {
+        setStatus('Notifications are not supported by this browser.');
+        return false;
+      }
+
+      if (!('serviceWorker' in navigator)) {
+        setStatus('Service workers are not supported by this browser.');
+        return false;
+      }
+
+      if (!('PushManager' in window)) {
+        setStatus('Web Push is not supported by this browser.');
+        return false;
+      }
+
+      return true;
+    };
+
+    const urlBase64ToUint8Array = (base64String) => {
+      const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+      const base64 = (base64String + padding)
+        .replace(/-/g, '+')
+        .replace(/_/g, '/');
+
+      const rawData = window.atob(base64);
+
+      return Uint8Array.from(
+        [...rawData].map((char) => char.charCodeAt(0))
+      );
+    };
+
+    const registerServiceWorker = async () => {
+      /*
+       * IMPORTANT:
+       * The worker is registered through the Shopify storefront app-proxy
+       * so the service worker belongs to the storefront origin.
+       */
+      return navigator.serviceWorker.register(
+        `${APP_PROXY_BASE}/push-sw.js`,
+        {
+          scope: `${APP_PROXY_BASE}/`,
+        }
+      );
+    };
+
+    const getPublicKey = async () => {
+      const response = await fetch(`${APP_PROXY_BASE}/config`, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`Config request failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (!data.publicKey) {
+        throw new Error('Push public key was not returned by the app.');
+      }
+
+      return data.publicKey;
+    };
+
+    const saveSubscription = async (subscription) => {
+      const response = await fetch(`${APP_PROXY_BASE}/subscribe`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          shop: root.dataset.shop,
+          subscription,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Subscription request failed: ${response.status}`);
+      }
+
+      return response.json();
+    };
+
+    const createPushSubscription = async () => {
+      const registration = await registerServiceWorker();
+
+      await navigator.serviceWorker.ready;
+
+      const publicKey = await getPublicKey();
+
+      let subscription = await registration.pushManager.getSubscription();
+
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey),
+        });
+      }
+
+      await saveSubscription(subscription.toJSON());
+
+      return subscription;
+    };
+
+    const updateState = async () => {
+      if (!checkSupport()) {
+        button.disabled = true;
+        return;
+      }
+
+      if (Notification.permission === 'denied') {
+        button.textContent = 'Notifications Blocked';
+        button.disabled = true;
+        setStatus(
+          'Notifications are blocked. Enable them in your browser settings.'
+        );
+        return;
+      }
+
+      if (Notification.permission === 'granted') {
+        /*
+         * Permission may already have been granted from our previous version.
+         * We still need to create/store the actual PushSubscription.
+         */
+        button.textContent = 'Connecting...';
+        button.disabled = true;
+        setStatus('Connecting this browser to notifications...');
+
+        try {
+          await createPushSubscription();
+
+          button.textContent = 'Notifications Enabled';
+          button.disabled = true;
+          setStatus('This browser is subscribed to notifications.');
+        } catch (error) {
+          console.error('Giveitpush subscription error:', error);
+
+          button.textContent = 'Retry Notifications';
+          button.disabled = false;
+          setStatus(
+            'Permission is enabled, but the push subscription could not be completed yet.'
+          );
+        }
+
+        return;
+      }
+
+      button.textContent = 'Allow Notifications';
+      button.disabled = false;
+      setStatus('');
+    };
+
+    button.addEventListener('click', async () => {
+      if (!checkSupport()) return;
+
+      button.disabled = true;
+      setStatus('Requesting notification permission...');
+
+      try {
+        const permission = await Notification.requestPermission();
+
+        if (permission !== 'granted') {
+          button.disabled = false;
+
+          if (permission === 'denied') {
+            button.textContent = 'Notifications Blocked';
+            setStatus(
+              'Notifications are blocked. Enable them in your browser settings.'
+            );
+          } else {
+            button.textContent = 'Allow Notifications';
+            setStatus('Notification permission was not granted.');
+          }
+
+          return;
+        }
+
+        button.textContent = 'Connecting...';
+        setStatus('Creating your secure push subscription...');
+
+        await createPushSubscription();
+
+        button.textContent = 'Notifications Enabled';
+        button.disabled = true;
+        setStatus('This browser is subscribed to notifications.');
+      } catch (error) {
+        console.error('Giveitpush push setup error:', error);
+
+        button.disabled = false;
+        button.textContent = 'Retry Notifications';
+        setStatus(
+          error instanceof Error
+            ? error.message
+            : 'Unable to enable push notifications.'
+        );
+      }
+    });
+
+    updateState().catch((error) => {
+      console.error('Giveitpush initialization error:', error);
+    });
+  })();
+</script>
+
+{% schema %}
+{
+  "name": "Giveitpush Notifications",
+  "target": "section",
+  "settings": []
+}
+{% endschema %}
