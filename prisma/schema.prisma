@@ -32,3 +32,15 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+model PushSubscription {
+  id         String   @id @default(cuid())
+  shop       String
+  endpoint   String
+  p256dh     String
+  auth       String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([shop, endpoint])
+  @@index([shop])
+}

@@ -135,18 +135,41 @@
       status.textContent = message;
     };
 
+    const setEnabledState = () => {
+      button.textContent = 'Notifications Enabled';
+      button.disabled = true;
+      setStatus('This browser is subscribed to notifications.');
+    };
+
+    const setBlockedState = () => {
+      button.textContent = 'Notifications Blocked';
+      button.disabled = true;
+      setStatus(
+        'Notifications are blocked. Enable them in your browser settings.'
+      );
+    };
+
+    const setErrorState = (message) => {
+      button.textContent = 'Retry Notifications';
+      button.disabled = false;
+      setStatus(message);
+    };
+
     const checkSupport = () => {
       if (!('Notification' in window)) {
+        button.disabled = true;
         setStatus('Notifications are not supported by this browser.');
         return false;
       }
 
       if (!('serviceWorker' in navigator)) {
+        button.disabled = true;
         setStatus('Service workers are not supported by this browser.');
         return false;
       }
 
       if (!('PushManager' in window)) {
+        button.disabled = true;
         setStatus('Web Push is not supported by this browser.');
         return false;
       }
@@ -156,6 +179,7 @@
 
     const urlBase64ToUint8Array = (base64String) => {
       const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+
       const base64 = (base64String + padding)
         .replace(/-/g, '+')
         .replace(/_/g, '/');
@@ -167,171 +191,230 @@
       );
     };
 
-    const registerServiceWorker = async () => {
-      /*
-       * IMPORTANT:
-       * The worker is registered through the Shopify storefront app-proxy
-       * so the service worker belongs to the storefront origin.
-       */
-      return navigator.serviceWorker.register(
-        `${APP_PROXY_BASE}/push-sw.js`,
-        {
-          scope: `${APP_PROXY_BASE}/`,
+    const getRegistration = async () => {
+      let registration =
+        await navigator.serviceWorker.getRegistration(
+          `${APP_PROXY_BASE}/`
+        );
+
+      if (
+        !registration ||
+        !registration.active
+      ) {
+        registration =
+          await navigator.serviceWorker.register(
+            `${APP_PROXY_BASE}/push-sw.js`,
+            {
+              scope: `${APP_PROXY_BASE}/`,
+            }
+          );
+
+        // Wait only for THIS registration to become active.
+        if (!registration.active) {
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              reject(
+                new Error(
+                  'Service worker activation timed out.'
+                )
+              );
+            }, 10000);
+
+            const checkActive = () => {
+              if (registration.active) {
+                clearTimeout(timeout);
+                resolve();
+                return;
+              }
+
+              setTimeout(checkActive, 100);
+            };
+
+            checkActive();
+          });
         }
-      );
+      }
+
+      return registration;
     };
 
     const getPublicKey = async () => {
-      const response = await fetch(`${APP_PROXY_BASE}/config`, {
-        method: 'GET',
-        credentials: 'same-origin',
-        headers: {
-          Accept: 'application/json',
-        },
-      });
+      const response = await fetch(
+        `${APP_PROXY_BASE}/config`,
+        {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+          },
+        }
+      );
 
       if (!response.ok) {
-        throw new Error(`Config request failed: ${response.status}`);
+        throw new Error(
+          `Unable to load push configuration (${response.status}).`
+        );
       }
 
       const data = await response.json();
 
       if (!data.publicKey) {
-        throw new Error('Push public key was not returned by the app.');
+        throw new Error(
+          'Push public key was not returned by the app.'
+        );
       }
 
       return data.publicKey;
     };
 
     const saveSubscription = async (subscription) => {
-      const response = await fetch(`${APP_PROXY_BASE}/subscribe`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          shop: root.dataset.shop,
-          subscription,
-        }),
-      });
+      const response = await fetch(
+        `${APP_PROXY_BASE}/subscribe`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            shop: root.dataset.shop,
+            subscription,
+          }),
+        }
+      );
 
       if (!response.ok) {
-        throw new Error(`Subscription request failed: ${response.status}`);
+        throw new Error(
+          `Unable to save push subscription (${response.status}).`
+        );
       }
 
       return response.json();
     };
 
-    const createPushSubscription = async () => {
-      const registration = await registerServiceWorker();
+    const ensurePushSubscription = async () => {
+      const registration = await getRegistration();
 
-      await navigator.serviceWorker.ready;
+      // IMPORTANT:
+      // Check the existing subscription FIRST.
+      // This makes page refreshes fast and prevents unnecessary
+      // PushManager.subscribe() calls.
+      let subscription =
+        await registration.pushManager.getSubscription();
+
+      if (subscription) {
+        await saveSubscription(
+          subscription.toJSON()
+        );
+
+        return subscription;
+      }
 
       const publicKey = await getPublicKey();
 
-      let subscription = await registration.pushManager.getSubscription();
-
-      if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
+      subscription =
+        await registration.pushManager.subscribe({
           userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(publicKey),
+          applicationServerKey:
+            urlBase64ToUint8Array(publicKey),
         });
-      }
 
-      await saveSubscription(subscription.toJSON());
+      await saveSubscription(
+        subscription.toJSON()
+      );
 
       return subscription;
     };
 
-    const updateState = async () => {
-      if (!checkSupport()) {
-        button.disabled = true;
-        return;
-      }
+    const initialize = async () => {
+      if (!checkSupport()) return;
 
       if (Notification.permission === 'denied') {
-        button.textContent = 'Notifications Blocked';
-        button.disabled = true;
-        setStatus(
-          'Notifications are blocked. Enable them in your browser settings.'
+        setBlockedState();
+        return;
+      }
+
+      /*
+       * If permission hasn't been granted yet, don't automatically
+       * ask on page load. Browser permission requests should come
+       * from a user interaction.
+       */
+      if (Notification.permission !== 'granted') {
+        button.textContent = 'Allow Notifications';
+        button.disabled = false;
+        setStatus('');
+        return;
+      }
+
+      /*
+       * Permission already exists.
+       * Check the actual push subscription and update the UI.
+       */
+      button.textContent = 'Checking...';
+      button.disabled = true;
+      setStatus(
+        'Checking notification subscription...'
+      );
+
+      try {
+        await ensurePushSubscription();
+
+        setEnabledState();
+      } catch (error) {
+        console.error(
+          'Giveitpush initialization error:',
+          error
         );
-        return;
+
+        setErrorState(
+          error instanceof Error
+            ? error.message
+            : 'Unable to connect notifications.'
+        );
       }
-
-      if (Notification.permission === 'granted') {
-        /*
-         * Permission may already have been granted from our previous version.
-         * We still need to create/store the actual PushSubscription.
-         */
-        button.textContent = 'Connecting...';
-        button.disabled = true;
-        setStatus('Connecting this browser to notifications...');
-
-        try {
-          await createPushSubscription();
-
-          button.textContent = 'Notifications Enabled';
-          button.disabled = true;
-          setStatus('This browser is subscribed to notifications.');
-        } catch (error) {
-          console.error('Giveitpush subscription error:', error);
-
-          button.textContent = 'Retry Notifications';
-          button.disabled = false;
-          setStatus(
-            'Permission is enabled, but the push subscription could not be completed yet.'
-          );
-        }
-
-        return;
-      }
-
-      button.textContent = 'Allow Notifications';
-      button.disabled = false;
-      setStatus('');
     };
 
     button.addEventListener('click', async () => {
       if (!checkSupport()) return;
 
       button.disabled = true;
-      setStatus('Requesting notification permission...');
+      button.textContent = 'Connecting...';
+      setStatus(
+        'Setting up your notification subscription...'
+      );
 
       try {
-        const permission = await Notification.requestPermission();
+        /*
+         * Only request permission from the actual button click.
+         */
+        if (Notification.permission !== 'granted') {
+          const permission =
+            await Notification.requestPermission();
 
-        if (permission !== 'granted') {
-          button.disabled = false;
+          if (permission !== 'granted') {
+            if (permission === 'denied') {
+              setBlockedState();
+            } else {
+              setErrorState(
+                'Notification permission was not granted.'
+              );
+            }
 
-          if (permission === 'denied') {
-            button.textContent = 'Notifications Blocked';
-            setStatus(
-              'Notifications are blocked. Enable them in your browser settings.'
-            );
-          } else {
-            button.textContent = 'Allow Notifications';
-            setStatus('Notification permission was not granted.');
+            return;
           }
-
-          return;
         }
 
-        button.textContent = 'Connecting...';
-        setStatus('Creating your secure push subscription...');
+        await ensurePushSubscription();
 
-        await createPushSubscription();
-
-        button.textContent = 'Notifications Enabled';
-        button.disabled = true;
-        setStatus('This browser is subscribed to notifications.');
+        setEnabledState();
       } catch (error) {
-        console.error('Giveitpush push setup error:', error);
+        console.error(
+          'Giveitpush push setup error:',
+          error
+        );
 
-        button.disabled = false;
-        button.textContent = 'Retry Notifications';
-        setStatus(
+        setErrorState(
           error instanceof Error
             ? error.message
             : 'Unable to enable push notifications.'
@@ -339,9 +422,7 @@
       }
     });
 
-    updateState().catch((error) => {
-      console.error('Giveitpush initialization error:', error);
-    });
+    initialize();
   })();
 </script>
 
